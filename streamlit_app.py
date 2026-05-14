@@ -10,7 +10,6 @@ from playwright.async_api import async_playwright
 # =========================================
 st.set_page_config(page_title="Bulk Newsletter Subscriber", page_icon="🚀", layout="wide")
 
-# This automatically installs Playwright browsers on the Streamlit server
 @st.cache_resource
 def install_playwright():
     os.system("playwright install chromium")
@@ -19,13 +18,13 @@ def install_playwright():
 install_playwright()
 
 # =========================================
-# 2. BOT CONFIGURATION
+# 2. BOT CONFIGURATION (Optimized for Speed)
 # =========================================
-MAX_CONCURRENT   = 4
-PAGE_LOAD_WAIT   = 3000
-DETECT_ATTEMPTS  = 3
-POPUP_WAIT       = 8
-SUCCESS_WAIT     = 4
+MAX_CONCURRENT   = 5     # Increased for better parallel processing
+PAGE_LOAD_WAIT   = 1000  # Dropped from 3000ms
+DETECT_ATTEMPTS  = 2     # Dropped from 3 to fail faster on bad sites
+POPUP_WAIT       = 5     # Dropped from 8
+SUCCESS_WAIT     = 3     # Dropped from 4
 
 # =========================================
 # 3. HELPER FUNCTIONS
@@ -45,9 +44,9 @@ async def remove_overlays(page):
     try:
         await page.evaluate("""
             document.querySelectorAll(
-                '.overlay,.modal-backdrop,.cookie-banner,' +
-                '.cookie-consent,.gdpr,[id*="cookie" i],[class*="cookie" i],' +
-                '[class*="sticky-bar" i],[class*="promo-bar" i],[class*="floating" i]'
+                '.overlay,.modal-backdrop,.cookie-banner,.cookie-consent,.gdpr,' +
+                '[id*="cookie" i],[class*="cookie" i],[class*="sticky-bar" i],' +
+                '[class*="promo-bar" i],[class*="floating" i]'
             ).forEach(e => e.remove());
             document.body.style.overflow = 'auto';
         """)
@@ -56,9 +55,8 @@ async def remove_overlays(page):
 async def scroll_to_bottom(page):
     try:
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await asyncio.sleep(1.2)
+        await asyncio.sleep(0.5) # Sped up
         await page.evaluate("window.scrollBy(0, -300)")
-        await asyncio.sleep(0.5)
     except: pass
 
 async def trigger_popups(page):
@@ -70,7 +68,6 @@ async def trigger_popups(page):
                 if (keywords.some(k => txt.includes(k))) { try { el.click(); } catch(e) {} }
             });
         """)
-        await asyncio.sleep(0.8)
     except: pass
 
 async def find_email_input(page):
@@ -96,9 +93,9 @@ async def find_email_input(page):
                 if el: return el
         except: pass
 
-    # Pass 2: Footer
+    # Pass 2: Footer (Only if pass 1 fails to save time)
     await scroll_to_bottom(page)
-    await asyncio.sleep(0.8)
+    await asyncio.sleep(0.5)
     for sel in selectors:
         try:
             locs = page.locator(sel)
@@ -127,7 +124,7 @@ async def click_submit(page, email_el=None):
         try:
             btn = page.locator(sel).first
             if await btn.is_visible():
-                await btn.click(force=True, timeout=2000)
+                await btn.click(force=True, timeout=1000)
                 return True
         except: pass
 
@@ -137,7 +134,6 @@ async def click_submit(page, email_el=None):
     except: return False
 
 async def check_success(page):
-    # STRICTER SUCCESS CHECKING
     success_selectors = [
         ".success-message", ".alert-success", "[data-ui='success-message']", 
         ".klaviyo-form-success", "#success-message"
@@ -146,22 +142,18 @@ async def check_success(page):
     success_texts = ["thank you", "subscribed", "check your email", "almost there", "got it"]
 
     for _ in range(SUCCESS_WAIT):
-        await asyncio.sleep(1)
-        
-        # 1. Check URL change
+        await asyncio.sleep(0.8) # Faster polling
         try:
             url = page.url.lower()
             if any(sig in url for sig in url_signals): return True
         except: pass
 
-        # 2. Check strict success boxes
         for sel in success_selectors:
             try:
                 if await page.locator(sel).count() > 0 and await page.locator(sel).first.is_visible():
                     return True
             except: pass
             
-        # 3. Check text content safely
         try:
             combined = "|".join(success_texts)
             if await page.locator(f"text=/{combined}/i").count() > 0: return True
@@ -176,11 +168,10 @@ async def process_one(context, domain, email, semaphore):
     async with semaphore:
         try:
             page = await context.new_page()
-            # Attempt to navigate
             try:
-                await page.goto(f"https://{domain}", wait_until="domcontentloaded", timeout=30000)
+                await page.goto(f"https://{domain}", wait_until="domcontentloaded", timeout=20000)
             except:
-                try: await page.goto(f"http://{domain}", wait_until="domcontentloaded", timeout=30000)
+                try: await page.goto(f"http://{domain}", wait_until="domcontentloaded", timeout=20000)
                 except:
                     await page.close()
                     return {"domain": domain, "status": "Error: Navigation failed"}
@@ -189,35 +180,26 @@ async def process_one(context, domain, email, semaphore):
             await remove_overlays(page)
             await trigger_popups(page)
 
-            # Detect Email Input
             email_input = None
             for _ in range(DETECT_ATTEMPTS):
                 email_input = await find_email_input(page)
                 if email_input: break
-                await asyncio.sleep(1)
 
             if not email_input:
                 await page.close()
                 return {"domain": domain, "status": "Failed: No email field found"}
 
-            # FIX: Human-like typing & Form trigger
             try:
                 await email_input.scroll_into_view_if_needed()
                 await email_input.focus()
-                await asyncio.sleep(0.5)
                 
-                # Type exactly like a human
-                await email_input.type(email, delay=random.randint(60, 120))
-                await asyncio.sleep(0.5)
-                
-                # Click away to trigger JS 'blur' (tells React/Vue we finished typing)
-                await page.mouse.click(10, 10)
-                await asyncio.sleep(0.5)
+                # Sped up human typing emulation
+                await email_input.type(email, delay=random.randint(20, 60))
+                await page.mouse.click(5, 5) # Blur click
             except Exception as e:
                 await page.close()
                 return {"domain": domain, "status": "Error: Could not fill email"}
 
-            # Submit & Verify
             submitted = await click_submit(page, email_input)
             if submitted:
                 success = await check_success(page)
@@ -250,12 +232,16 @@ async def run_bot(domains, email, progress_bar, status_text):
 
         semaphore = asyncio.Semaphore(MAX_CONCURRENT)
         
-        # Process sequentially to update UI in real-time
-        for i, domain in enumerate(domains):
-            status_text.text(f"Processing ({i+1}/{len(domains)}): {domain}...")
-            res = await process_one(context, domain, email, semaphore)
+        # FIX: Process tasks concurrently and yield as they complete
+        tasks = [process_one(context, domain, email, semaphore) for domain in domains]
+        
+        completed = 0
+        for future in asyncio.as_completed(tasks):
+            res = await future
             results.append(res)
-            progress_bar.progress((i + 1) / len(domains))
+            completed += 1
+            status_text.text(f"Processed ({completed}/{len(domains)}): {res['domain']}")
+            progress_bar.progress(completed / len(domains))
 
         await browser.close()
     return results
@@ -288,14 +274,12 @@ with col2:
             progress_bar = st.progress(0)
             status_text = st.empty()
 
-            # Create a new event loop for Streamlit thread compatibility
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             results = loop.run_until_complete(run_bot(domains, email_addr, progress_bar, status_text))
             
             status_text.success("All tasks completed!")
 
-            # Prepare Data
             df = pd.DataFrame(results)
             total = len(df)
             confirmed = len(df[df["status"] == "Subscribed ✓"])
