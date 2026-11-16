@@ -73,29 +73,35 @@ TRIGGER_POPUPS_JS = """
 TAG_BEST_INPUT_JS = """
 () => {
   document.querySelectorAll('[data-bsub-target]').forEach(e => e.removeAttribute('data-bsub-target'));
-  const good = /newsletter|subscribe|subscription|signup|sign-up|join|updates|mailing|offers|deals|klaviyo|mailchimp|mc-embedded/i;
+  const hardEmail = /e-?mail/i;
+  const softEmail = /\\bnl\\b|newsletter|subscribe|sign-?up/i;
+  const good = /newsletter|subscribe|subscription|signup|sign-up|join|updates|mailing|email list|offers|deals|klaviyo|mailchimp|mc-embedded/i;
   const bad  = /search|login|log-in|signin|sign-in|password|checkout|coupon|contact|comment|account|register/i;
-  const sel = "input[type='email'],input[name*='email' i],input[id*='email' i]," +
-              "input[placeholder*='email' i],input[autocomplete='email']";
+  const sel = "input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit])" +
+              ":not([type=button]):not([type=password]):not([type=search]):not([type=file]):not([type=number])";
   let best = null, bestScore = -1e9;
   document.querySelectorAll(sel).forEach(el => {
-    const t = (el.type || '').toLowerCase();
-    if (['hidden','checkbox','radio','submit','button'].includes(t) || el.disabled || el.readOnly) return;
+    if (el.disabled || el.readOnly) return;
     const r = el.getBoundingClientRect(), cs = getComputedStyle(el);
     if (r.width < 50 || r.height < 10 || cs.visibility === 'hidden' || cs.display === 'none') return;
     const form = el.closest('form');
-    const root = form || el.parentElement;
+    const wrap = el.closest('label,li,div') || el.parentElement;
+    const labels = [...(el.labels || [])].map(l => l.innerText).join(' ');
+    const attrs = [el.type, el.name, el.id, el.placeholder, el.getAttribute('aria-label'),
+                   el.autocomplete, el.inputMode, el.title, labels].join(' ');
+    const near = ((wrap && wrap.innerText) || '').slice(0, 80);   // floating-label text
+    const isEmail = el.type === 'email' || hardEmail.test(attrs) || hardEmail.test(near) || softEmail.test(attrs);
+    if (!isEmail) return;
+    const formAttrs = form ? [form.id, String(form.className || ''), form.getAttribute('action') || ''].join(' ') : '';
+    const root = form || (wrap && wrap.parentElement) || el.parentElement;
+    const ctx = formAttrs + ' ' + attrs + ' ' + ((root && root.innerText) || '').slice(0, 300);
     let score = 0;
-    const ctx = [
-      form ? (form.id || '') : '', form ? String(form.className || '') : '',
-      form ? (form.getAttribute('action') || '') : '',
-      el.name || '', el.id || '', el.placeholder || '',
-      (root.innerText || '').slice(0, 300)
-    ].join(' ');
+    if (el.type === 'email') score += 3;
     if (good.test(ctx)) score += 5;
-    if (bad.test(ctx)) score -= 8;
+    if (bad.test(formAttrs + ' ' + attrs)) score -= 8;
     if (form && form.querySelector('input[type=password]')) score -= 12;
     if (form && (form.getAttribute('role') === 'search' || form.querySelector('input[type=search]'))) score -= 12;
+    if (el.closest('header,nav,[role=search]')) score -= 6;
     if (el.closest('footer')) score += 2;
     if (el.closest('[class*=popup i],[class*=modal i],[id*=klaviyo i]')) score += 2;
     if (score > bestScore) { bestScore = score; best = el; }
@@ -103,6 +109,14 @@ TAG_BEST_INPUT_JS = """
   if (best && bestScore > -8) { best.setAttribute('data-bsub-target', '1'); return true; }
   return false;
 }
+"""
+
+DUMP_INPUTS_JS = """
+() => [...document.querySelectorAll('input:not([type=hidden])')]
+  .filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; })
+  .slice(0, 8)
+  .map(e => [e.type, e.name, e.id, e.placeholder, e.getAttribute('aria-label')].join('|'))
+  .join(' ; ')
 """
 
 # Tick required consent boxes, fill required text fields, report validity
@@ -134,7 +148,7 @@ FIND_BUTTON_JS = """
   const root = form || el.parentElement.closest('div,section,aside,footer') || document.body;
   return root.querySelector("button[type=submit],input[type=submit]")
       || [...root.querySelectorAll("button,[role=button],input[type=button],a")]
-           .find(b => /subscribe|sign up|signup|join|submit|send|notify|get|go/i
+           .find(b => /\\b(subscribe|sign up|signup|join|submit|send|notify|get|go)\\b/i
                       .test((b.innerText || b.value || '').trim()))
       || null;
 }
@@ -178,32 +192,39 @@ def request_has_email(req, email):
     return False
 
 
-async def tag_best_input(page):
-    try:
-        return await page.evaluate(TAG_BEST_INPUT_JS)
-    except Exception:
-        return False
+async def tag_in_any_frame(page):
+    """Run the scorer in the main page and every iframe; return a locator for the winner."""
+    for frame in page.frames:
+        try:
+            if await frame.evaluate(TAG_BEST_INPUT_JS):
+                return frame.locator("[data-bsub-target='1']").first
+        except Exception:
+            pass
+    return None
 
 
 async def locate_email_input(page):
-    """Find newsletter input: as-is, then after popups, then after scrolling to footer."""
-    target = page.locator("[data-bsub-target='1']").first
-    if await tag_best_input(page):
-        return target
+    """As-is, then after popups, then after scrolling (lazy footers) twice."""
+    loc = await tag_in_any_frame(page)
+    if loc:
+        return loc
     try:
         await page.evaluate(TRIGGER_POPUPS_JS)
     except Exception:
         pass
     await page.wait_for_timeout(1200)
-    if await tag_best_input(page):
-        return target
-    try:
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-    except Exception:
-        pass
-    await page.wait_for_timeout(1000)
-    if await tag_best_input(page):
-        return target
+    loc = await tag_in_any_frame(page)
+    if loc:
+        return loc
+    for _ in range(2):
+        try:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        except Exception:
+            pass
+        await page.wait_for_timeout(1500)
+        loc = await tag_in_any_frame(page)
+        if loc:
+            return loc
     return None
 
 
@@ -261,7 +282,21 @@ async def process_one(context, domain, email, semaphore, want_shots):
 
             loc = await locate_email_input(page)
             if loc is None:
-                res.update(result="✗ no email field", detail="no newsletter-looking email input found")
+                try:
+                    dump = await page.evaluate(DUMP_INPUTS_JS)
+                except Exception:
+                    dump = ""
+                res.update(
+                    result="✗ no email field",
+                    detail=f"iframes: {len(page.frames) - 1} | visible inputs: {dump or 'none'}"[:300],
+                )
+                try:
+                    res["final_url"] = page.url
+                except Exception:
+                    pass
+                if want_shots:
+                    try: shot = await page.screenshot(type="jpeg", quality=60)
+                    except Exception: pass
                 return res
 
             # ---- fill ----
