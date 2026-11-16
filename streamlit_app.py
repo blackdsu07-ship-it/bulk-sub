@@ -5,6 +5,7 @@ import io
 import os
 import random
 import re
+import sys
 import zipfile
 from urllib.parse import unquote_plus, urlparse
 
@@ -19,9 +20,10 @@ st.set_page_config(page_title="Bulk Newsletter Subscriber", page_icon="🚀", la
 
 @st.cache_resource
 def install_playwright():
-    os.system("playwright install chromium")
+    # python -m works even when the `playwright` command isn't on PATH (common on Windows)
+    os.system(f'"{sys.executable}" -m playwright install chromium')
     if os.path.exists("/mount/src"):  # Streamlit Cloud
-        os.system("playwright install-deps chromium")
+        os.system(f'"{sys.executable}" -m playwright install-deps chromium')
 
 
 install_playwright()
@@ -31,13 +33,14 @@ install_playwright()
 # =========================================
 PAGE_LOAD_WAIT = 1500   # ms after domcontentloaded
 REQUEST_WAIT   = 8      # s to wait for the signup request after clicking
+CAPTCHA_WAIT   = 60     # s a human gets to solve a visible captcha (headed mode only)
 SETTLE_WAIT    = 1.5    # s extra after first matching request (let responses finish)
 
 # Requests to these hosts never count as "signup sent"
 ANALYTICS = re.compile(
     r"google-analytics|googletagmanager|doubleclick|facebook\.|hotjar|clarity\.ms|"
     r"mixpanel|sentry|newrelic|datadoghq|pinterest|tiktok|snapchat|criteo|taboola|"
-    r"outbrain|bing\.com|linkedin\.com/px|segment\.(io|com)|fullstory|hubspot.*analytics",
+    r"outbrain|listrakbi|applovin|appsflyer|adjust\.com|reddit|ads-twitter|adroll|tatari|rtbhouse|amazon-adsystem|adsrvr|bing\.com|linkedin\.com/px|segment\.(io|com)|fullstory|hubspot.*analytics",
     re.I,
 )
 SKIP_TYPES = {"image", "stylesheet", "font", "media", "ping"}
@@ -118,6 +121,40 @@ DUMP_INPUTS_JS = """
   .slice(0, 8)
   .map(e => [e.type, e.name, e.id, e.placeholder, e.getAttribute('aria-label')].join('|'))
   .join(' ; ')
+"""
+
+DISMISS_BLOCKERS_JS = """
+() => {
+  const target = document.querySelector('[data-bsub-target]');
+  const vis = e => {
+    const r = e.getBoundingClientRect(), cs = getComputedStyle(e);
+    return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none' && cs.opacity !== '0';
+  };
+  const closeSel = '[aria-label*="close" i],[title*="close" i],[class*="close" i],[id*="close" i],[data-dismiss],[data-testid*="close" i]';
+  const textRe = /^(×|✕|✖|x|close|no thanks?|no,? thanks?|maybe later|not now|dismiss|skip|i'?ll pass)$/i;
+  const nameSel = '[role="dialog"],[aria-modal="true"],[class*="modal" i],[class*="popup" i],[id*="popup" i],' +
+                  '[class*="overlay" i],[class*="lightbox" i],[class*="interstitial" i]';
+  const cands = new Set(document.querySelectorAll(nameSel));
+  document.querySelectorAll('body > *, body > * > *').forEach(e => {
+    const cs = getComputedStyle(e), r = e.getBoundingClientRect();
+    if (cs.position === 'fixed' && (parseInt(cs.zIndex) || 0) >= 100 &&
+        r.width >= innerWidth * 0.5 && r.height >= innerHeight * 0.3) cands.add(e);
+  });
+  let n = 0;
+  cands.forEach(e => {
+    if (e === document.body || e === document.documentElement) return;
+    if (!vis(e) || !['fixed', 'absolute', 'sticky'].includes(getComputedStyle(e).position)) return;
+    if (target && e.contains(target)) return;            // never touch the popup that holds our form
+    if (e.querySelector('main,header,nav,footer')) return; // never touch page chrome
+    const c = [...e.querySelectorAll(closeSel + ',button,[role=button],a')]
+      .find(b => vis(b) && (b.matches(closeSel) || textRe.test((b.innerText || b.getAttribute('aria-label') || '').trim())));
+    if (c) { try { c.click(); } catch (x) {} }
+    e.style.setProperty('display', 'none', 'important');
+    n++;
+  });
+  document.body.style.overflow = 'auto';
+  return n;
+}
 """
 
 # Tick required consent boxes, fill required text fields, report validity
@@ -215,8 +252,39 @@ async def tag_in_any_frame(page):
     return None
 
 
+async def dismiss_blockers(page):
+    """Close/hide popups, modals and big fixed overlays, except ones containing the tagged input."""
+    try:
+        return await page.evaluate(DISMISS_BLOCKERS_JS)
+    except Exception:
+        return 0
+
+
+async def fill_email(loc, page, email):
+    """Type the email; if a late popup steals focus or the value is wrong, clear popups and retry."""
+    for _ in range(3):
+        try:
+            await loc.scroll_into_view_if_needed(timeout=3000)
+            await loc.focus()
+            await loc.fill("")
+            await loc.press_sequentially(email, delay=random.randint(20, 60))
+            if (await loc.input_value()) == email:
+                return True
+        except Exception:
+            pass
+        await dismiss_blockers(page)
+        await page.wait_for_timeout(500)
+    return False
+
+
 async def locate_email_input(page):
-    """As-is, then after popups, then after scrolling (lazy footers) twice."""
+    """Find the newsletter input, clearing popups that cover it (never ones that contain it)."""
+    loc = await tag_in_any_frame(page)
+    if loc:
+        await dismiss_blockers(page)
+        return loc
+    await dismiss_blockers(page)
+    await page.wait_for_timeout(600)
     loc = await tag_in_any_frame(page)
     if loc:
         return loc
@@ -227,6 +295,7 @@ async def locate_email_input(page):
     await page.wait_for_timeout(1200)
     loc = await tag_in_any_frame(page)
     if loc:
+        await dismiss_blockers(page)
         return loc
     for _ in range(2):
         try:
@@ -236,6 +305,7 @@ async def locate_email_input(page):
         await page.wait_for_timeout(1500)
         loc = await tag_in_any_frame(page)
         if loc:
+            await dismiss_blockers(page)
             return loc
     return None
 
@@ -287,7 +357,7 @@ async def has_captcha(page):
 # =========================================
 # 5. CORE
 # =========================================
-async def process_one(context, domain, email, semaphore, want_shots, challenge_timeout=15):
+async def process_one(context, domain, email, semaphore, want_shots, challenge_timeout=15, headed=False):
     async with semaphore:
         res = {"domain": domain, "result": "✗ error", "detail": "", "final_url": ""}
         shot = None
@@ -349,15 +419,13 @@ async def process_one(context, domain, email, semaphore, want_shots, challenge_t
                 return res
 
             # ---- fill ----
-            try:
-                await loc.scroll_into_view_if_needed(timeout=3000)
-                await loc.focus()
-                await loc.fill("")
-                await loc.press_sequentially(email, delay=random.randint(20, 60))
-                await loc.evaluate("e => { e.dispatchEvent(new Event('change', {bubbles: true})); e.blur(); }")
-            except Exception as e:
-                res.update(result="✗ error", detail=f"could not fill email: {str(e)[:60]}")
+            if not await fill_email(loc, page, email):
+                res.update(result="✗ error", detail="could not fill email (covered by a popup?)")
                 return res
+            try:
+                await loc.evaluate("e => { e.dispatchEvent(new Event('change', {bubbles: true})); e.blur(); }")
+            except Exception:
+                pass
 
             # ---- validity / consents ----
             try:
@@ -376,6 +444,7 @@ async def process_one(context, domain, email, semaphore, want_shots, challenge_t
             on_req = lambda r: captured.append(r) if request_has_email(r, email) else None
             page.on("request", on_req)
 
+            await dismiss_blockers(page)  # popups that appeared while typing
             btn = None
             try:
                 btn = (await loc.evaluate_handle(FIND_BUTTON_JS)).as_element()
@@ -387,7 +456,11 @@ async def process_one(context, domain, email, semaphore, want_shots, challenge_t
                     try:
                         await btn.click(timeout=3000)
                     except Exception:
-                        await btn.click(timeout=2000, force=True)
+                        await dismiss_blockers(page)
+                        try:
+                            await btn.click(timeout=2000)
+                        except Exception:
+                            await btn.click(timeout=2000, force=True)
                 else:
                     sent = await loc.evaluate(
                         "e => { const f = e.closest('form'); "
@@ -404,6 +477,12 @@ async def process_one(context, domain, email, semaphore, want_shots, challenge_t
             while waited < REQUEST_WAIT and not captured:
                 await asyncio.sleep(0.5)
                 waited += 0.5
+            if not captured and headed and await has_captcha(page):
+                # human-in-the-loop: solve the captcha (and press submit if needed) in the visible window
+                waited = 0.0
+                while waited < CAPTCHA_WAIT and not captured:
+                    await asyncio.sleep(1)
+                    waited += 1
             if captured:
                 await asyncio.sleep(SETTLE_WAIT)
 
@@ -414,15 +493,23 @@ async def process_one(context, domain, email, semaphore, want_shots, challenge_t
                 pass
 
             ok = [x for x in reqs if x[2] and x[2] < 400]
-            if ok:
+            fu = res["final_url"]
+            url_confirm = (
+                bool(re.search(r"success|thank|confirm|subscribed", fu, re.I))
+                and email.lower() in unquote_plus(fu).lower()
+            )
+            if url_confirm:
+                extra = f" | {ok[0][0]} {ok[0][1]} → {ok[0][2]}" if ok else ""
+                res.update(result="✓ success page", detail=f"redirected to success URL echoing the email{extra}")
+            elif ok:
                 m, host, code = ok[0]
                 res.update(result="✓ request accepted", detail=f"{m} {host} → {code}")
             elif reqs:
-                m, host, code = reqs[0]
-                if code is None:
-                    res.update(result="? request sent, no response", detail=f"{m} {host}")
+                seen = "; ".join(f"{m} {h} → {c}" for m, h, c in reqs[:3])
+                if all(c is None for _, _, c in reqs):
+                    res.update(result="? request sent, no response", detail=seen)
                 else:
-                    res.update(result="✗ request rejected", detail=f"{m} {host} → {code}")
+                    res.update(result="✗ request rejected", detail=seen)
             else:
                 res.update(result="✗ no request sent", detail="click happened, nothing carried the email")
 
@@ -481,7 +568,7 @@ async def run_bot(domains, email, concurrency, want_shots, progress_bar, status_
         await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
 
         semaphore = asyncio.Semaphore(concurrency)
-        tasks = [process_one(context, d, email, semaphore, want_shots, 90 if headed else 15) for d in domains]
+        tasks = [process_one(context, d, email, semaphore, want_shots, 90 if headed else 15, headed) for d in domains]
 
         done = 0
         for fut in asyncio.as_completed(tasks):
@@ -515,7 +602,7 @@ with col1:
         proxy_url = st.text_input("Proxy (optional)", placeholder="http://user:pass@host:port")
         show_browser = st.checkbox(
             "Show real browser window (run locally only)", value=False,
-            help="Needs a display. If a site shows a human-check, you can complete it yourself in the window (waits up to 90s).",
+            help="Needs a display. If a site shows a human-check or captcha, solve it yourself in the window (waits 60-90s), then it continues.",
         )
         start_btn = st.button("Start Automation", type="primary", use_container_width=True)
 
