@@ -1,8 +1,14 @@
 import streamlit as st
 import asyncio
-import random
-import pandas as pd
+import base64
+import io
 import os
+import random
+import re
+import zipfile
+from urllib.parse import unquote_plus, urlparse
+
+import pandas as pd
 from playwright.async_api import async_playwright
 
 # =========================================
@@ -10,258 +16,401 @@ from playwright.async_api import async_playwright
 # =========================================
 st.set_page_config(page_title="Bulk Newsletter Subscriber", page_icon="🚀", layout="wide")
 
+
 @st.cache_resource
 def install_playwright():
     os.system("playwright install chromium")
     os.system("playwright install-deps chromium")
 
+
 install_playwright()
 
 # =========================================
-# 2. BOT CONFIGURATION (Optimized for Speed)
+# 2. CONFIG
 # =========================================
-MAX_CONCURRENT   = 5     # Increased for better parallel processing
-PAGE_LOAD_WAIT   = 1000  # Dropped from 3000ms
-DETECT_ATTEMPTS  = 2     # Dropped from 3 to fail faster on bad sites
-POPUP_WAIT       = 5     # Dropped from 8
-SUCCESS_WAIT     = 3     # Dropped from 4
+PAGE_LOAD_WAIT = 1500   # ms after domcontentloaded
+REQUEST_WAIT   = 8      # s to wait for the signup request after clicking
+SETTLE_WAIT    = 1.5    # s extra after first matching request (let responses finish)
+
+# Requests to these hosts never count as "signup sent"
+ANALYTICS = re.compile(
+    r"google-analytics|googletagmanager|doubleclick|facebook\.|hotjar|clarity\.ms|"
+    r"mixpanel|sentry|newrelic|datadoghq|pinterest|tiktok|snapchat|criteo|taboola|"
+    r"outbrain|bing\.com|linkedin\.com/px|segment\.(io|com)|fullstory|hubspot.*analytics",
+    re.I,
+)
+SKIP_TYPES = {"image", "stylesheet", "font", "media", "ping"}
 
 # =========================================
-# 3. HELPER FUNCTIONS
+# 3. PAGE JS
+# =========================================
+CLEAN_OVERLAYS_JS = """
+() => {
+  const sel = '#onetrust-banner-sdk,#onetrust-consent-sdk,.cookie-banner,.cookie-consent,' +
+              '.cc-window,#cookie-banner,#CybotCookiebotDialog,.truste_overlay';
+  document.querySelectorAll(sel).forEach(e => {
+    if (!e.querySelector('input[type=email]')) e.remove();
+  });
+  document.body.style.overflow = 'auto';
+}
+"""
+
+# Only click things that cannot navigate away
+TRIGGER_POPUPS_JS = """
+() => {
+  const kw = ['subscribe', 'sign up', 'signup', 'newsletter'];
+  document.querySelectorAll(
+    'button,[role="button"],a[href="#"],a[href^="javascript"],a:not([href])'
+  ).forEach(el => {
+    if (el.closest('form') && el.closest('form').querySelector('input[type=password]')) return;
+    const t = (el.innerText || '').toLowerCase();
+    if (kw.some(k => t.includes(k))) { try { el.click(); } catch (e) {} }
+  });
+}
+"""
+
+# Score every email-ish input, tag the best newsletter-looking one
+TAG_BEST_INPUT_JS = """
+() => {
+  document.querySelectorAll('[data-bsub-target]').forEach(e => e.removeAttribute('data-bsub-target'));
+  const good = /newsletter|subscribe|subscription|signup|sign-up|join|updates|mailing|offers|deals|klaviyo|mailchimp|mc-embedded/i;
+  const bad  = /search|login|log-in|signin|sign-in|password|checkout|coupon|contact|comment|account|register/i;
+  const sel = "input[type='email'],input[name*='email' i],input[id*='email' i]," +
+              "input[placeholder*='email' i],input[autocomplete='email']";
+  let best = null, bestScore = -1e9;
+  document.querySelectorAll(sel).forEach(el => {
+    const t = (el.type || '').toLowerCase();
+    if (['hidden','checkbox','radio','submit','button'].includes(t) || el.disabled || el.readOnly) return;
+    const r = el.getBoundingClientRect(), cs = getComputedStyle(el);
+    if (r.width < 50 || r.height < 10 || cs.visibility === 'hidden' || cs.display === 'none') return;
+    const form = el.closest('form');
+    const root = form || el.parentElement;
+    let score = 0;
+    const ctx = [
+      form ? (form.id || '') : '', form ? String(form.className || '') : '',
+      form ? (form.getAttribute('action') || '') : '',
+      el.name || '', el.id || '', el.placeholder || '',
+      (root.innerText || '').slice(0, 300)
+    ].join(' ');
+    if (good.test(ctx)) score += 5;
+    if (bad.test(ctx)) score -= 8;
+    if (form && form.querySelector('input[type=password]')) score -= 12;
+    if (form && (form.getAttribute('role') === 'search' || form.querySelector('input[type=search]'))) score -= 12;
+    if (el.closest('footer')) score += 2;
+    if (el.closest('[class*=popup i],[class*=modal i],[id*=klaviyo i]')) score += 2;
+    if (score > bestScore) { bestScore = score; best = el; }
+  });
+  if (best && bestScore > -8) { best.setAttribute('data-bsub-target', '1'); return true; }
+  return false;
+}
+"""
+
+# Tick required consent boxes, fill required text fields, report validity
+PREP_FORM_JS = """
+(el) => {
+  const form = el.closest('form');
+  const root = form || el.parentElement.closest('div,section,aside,footer') || document.body;
+  root.querySelectorAll("input[type=checkbox][required]").forEach(c => { if (!c.checked) c.click(); });
+  root.querySelectorAll("input[required]").forEach(i => {
+    const t = (i.type || 'text').toLowerCase();
+    if (t === 'text' && !i.value) {
+      i.value = 'Alex';
+      i.dispatchEvent(new Event('input', {bubbles: true}));
+      i.dispatchEvent(new Event('change', {bubbles: true}));
+    }
+  });
+  let invalid = null;
+  if (form && !form.checkValidity()) {
+    const bad = form.querySelector(':invalid');
+    invalid = bad ? (bad.name || bad.id || bad.type || 'field') : 'field';
+  }
+  return {invalid};
+}
+"""
+
+FIND_BUTTON_JS = """
+(el) => {
+  const form = el.closest('form');
+  const root = form || el.parentElement.closest('div,section,aside,footer') || document.body;
+  return root.querySelector("button[type=submit],input[type=submit]")
+      || [...root.querySelectorAll("button,[role=button],input[type=button],a")]
+           .find(b => /subscribe|sign up|signup|join|submit|send|notify|get|go/i
+                      .test((b.innerText || b.value || '').trim()))
+      || null;
+}
+"""
+
+
+# =========================================
+# 4. HELPERS
 # =========================================
 def parse_domains(text):
-    if not text: return []
+    if not text:
+        return []
     raw = text.replace(",", "\n").split("\n")
     domains = []
     for d in raw:
         d = d.strip()
-        if not d: continue
+        if not d:
+            continue
         d = d.replace("https://", "").replace("http://", "").split("/")[0]
-        if "." in d: domains.append(d)
+        if "." in d:
+            domains.append(d)
     return domains
 
-async def remove_overlays(page):
+
+def request_has_email(req, email):
+    """True if this request looks like it carries the email to some backend."""
     try:
-        await page.evaluate("""
-            document.querySelectorAll(
-                '.overlay,.modal-backdrop,.cookie-banner,.cookie-consent,.gdpr,' +
-                '[id*="cookie" i],[class*="cookie" i],[class*="sticky-bar" i],' +
-                '[class*="promo-bar" i],[class*="floating" i]'
-            ).forEach(e => e.remove());
-            document.body.style.overflow = 'auto';
-        """)
-    except: pass
-
-async def scroll_to_bottom(page):
-    try:
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await asyncio.sleep(0.5) # Sped up
-        await page.evaluate("window.scrollBy(0, -300)")
-    except: pass
-
-async def trigger_popups(page):
-    try:
-        await page.evaluate("""
-            const keywords = ['subscribe','sign up','signup','join','newsletter','offer'];
-            document.querySelectorAll('button, a, [role="button"]').forEach(el => {
-                const txt = (el.innerText || '').toLowerCase();
-                if (keywords.some(k => txt.includes(k))) { try { el.click(); } catch(e) {} }
-            });
-        """)
-    except: pass
-
-async def find_email_input(page):
-    selectors = [
-        "input[type='email']", "input[name*='email' i]", "input[id*='email' i]",
-        "input[placeholder*='email' i]", "input[autocomplete='email']", ".hs-email"
-    ]
-    
-    async def check(el):
+        if ANALYTICS.search(req.url) or req.resource_type in SKIP_TYPES:
+            return False
+        raw = req.url
         try:
-            if await el.is_visible():
-                box = await el.bounding_box()
-                if box and box["width"] > 50: return el
-        except: return None
-        return None
-
-    # Pass 1: Main View
-    for sel in selectors:
-        try:
-            locs = page.locator(sel)
-            for i in range(min(await locs.count(), 3)):
-                el = await check(locs.nth(i))
-                if el: return el
-        except: pass
-
-    # Pass 2: Footer (Only if pass 1 fails to save time)
-    await scroll_to_bottom(page)
-    await asyncio.sleep(0.5)
-    for sel in selectors:
-        try:
-            locs = page.locator(sel)
-            for i in range(min(await locs.count(), 3)):
-                el = await check(locs.nth(i))
-                if el: return el
-        except: pass
-
-    return None
-
-async def click_submit(page, email_el=None):
-    if email_el:
-        try:
-            done = await page.evaluate("""(el) => {
-                const form = el.closest('form');
-                if (form) {
-                    const btn = form.querySelector('button[type=submit],input[type=submit]');
-                    if (btn) { btn.click(); return true; }
-                    form.submit(); return true;
-                } return false;
-            }""", email_el)
-            if done: return True
-        except: pass
-
-    for sel in ["button[type='submit']", "input[type='submit']", "button:has-text('Subscribe')"]:
-        try:
-            btn = page.locator(sel).first
-            if await btn.is_visible():
-                await btn.click(force=True, timeout=1000)
-                return True
-        except: pass
-
-    try:
-        await page.keyboard.press("Enter")
-        return True
-    except: return False
-
-async def check_success(page):
-    success_selectors = [
-        ".success-message", ".alert-success", "[data-ui='success-message']", 
-        ".klaviyo-form-success", "#success-message"
-    ]
-    url_signals = ["thank", "success", "confirm", "subscribed", "welcome"]
-    success_texts = ["thank you", "subscribed", "check your email", "almost there", "got it"]
-
-    for _ in range(SUCCESS_WAIT):
-        await asyncio.sleep(0.8) # Faster polling
-        try:
-            url = page.url.lower()
-            if any(sig in url for sig in url_signals): return True
-        except: pass
-
-        for sel in success_selectors:
-            try:
-                if await page.locator(sel).count() > 0 and await page.locator(sel).first.is_visible():
-                    return True
-            except: pass
-            
-        try:
-            combined = "|".join(success_texts)
-            if await page.locator(f"text=/{combined}/i").count() > 0: return True
-        except: pass
-
+            raw += " " + (req.post_data or "")
+        except Exception:
+            pass
+        if email.lower() in unquote_plus(raw).lower():
+            return True
+        if base64.b64encode(email.encode()).decode().rstrip("=") in raw:
+            return True
+    except Exception:
+        pass
     return False
 
+
+async def tag_best_input(page):
+    try:
+        return await page.evaluate(TAG_BEST_INPUT_JS)
+    except Exception:
+        return False
+
+
+async def locate_email_input(page):
+    """Find newsletter input: as-is, then after popups, then after scrolling to footer."""
+    target = page.locator("[data-bsub-target='1']").first
+    if await tag_best_input(page):
+        return target
+    try:
+        await page.evaluate(TRIGGER_POPUPS_JS)
+    except Exception:
+        pass
+    await page.wait_for_timeout(1200)
+    if await tag_best_input(page):
+        return target
+    try:
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    except Exception:
+        pass
+    await page.wait_for_timeout(1000)
+    if await tag_best_input(page):
+        return target
+    return None
+
+
+async def summarize_requests(captured):
+    out = []
+    for r in captured[:6]:
+        try:
+            resp = await asyncio.wait_for(r.response(), 8)
+            code = resp.status if resp else None
+        except Exception:
+            code = None
+        out.append((r.method, urlparse(r.url).netloc, code))
+    return out
+
+
+async def has_captcha(page):
+    try:
+        return any(
+            re.search(r"recaptcha|hcaptcha|turnstile|challenges\.cloudflare", f.url, re.I)
+            for f in page.frames
+        )
+    except Exception:
+        return False
+
+
 # =========================================
-# 4. CORE PROCESSING LOGIC
+# 5. CORE
 # =========================================
-async def process_one(context, domain, email, semaphore):
+async def process_one(context, domain, email, semaphore, want_shots):
     async with semaphore:
+        res = {"domain": domain, "result": "✗ error", "detail": "", "final_url": ""}
+        shot = None
+        page = None
+        on_req = None
         try:
             page = await context.new_page()
-            try:
-                await page.goto(f"https://{domain}", wait_until="domcontentloaded", timeout=20000)
-            except:
-                try: await page.goto(f"http://{domain}", wait_until="domcontentloaded", timeout=20000)
-                except:
-                    await page.close()
-                    return {"domain": domain, "status": "Error: Navigation failed"}
+
+            nav_ok = False
+            for scheme in ("https", "http"):
+                try:
+                    await page.goto(f"{scheme}://{domain}", wait_until="domcontentloaded", timeout=20000)
+                    nav_ok = True
+                    break
+                except Exception:
+                    pass
+            if not nav_ok:
+                res["detail"] = "navigation failed"
+                return res
 
             await page.wait_for_timeout(PAGE_LOAD_WAIT)
-            await remove_overlays(page)
-            await trigger_popups(page)
+            try:
+                await page.evaluate(CLEAN_OVERLAYS_JS)
+            except Exception:
+                pass
 
-            email_input = None
-            for _ in range(DETECT_ATTEMPTS):
-                email_input = await find_email_input(page)
-                if email_input: break
+            loc = await locate_email_input(page)
+            if loc is None:
+                res.update(result="✗ no email field", detail="no newsletter-looking email input found")
+                return res
 
-            if not email_input:
-                await page.close()
-                return {"domain": domain, "status": "Failed: No email field found"}
+            # ---- fill ----
+            try:
+                await loc.scroll_into_view_if_needed(timeout=3000)
+                await loc.focus()
+                await loc.fill("")
+                await loc.press_sequentially(email, delay=random.randint(20, 60))
+                await loc.evaluate("e => { e.dispatchEvent(new Event('change', {bubbles: true})); e.blur(); }")
+            except Exception as e:
+                res.update(result="✗ error", detail=f"could not fill email: {str(e)[:60]}")
+                return res
+
+            # ---- validity / consents ----
+            try:
+                prep = await loc.evaluate(PREP_FORM_JS)
+            except Exception:
+                prep = {"invalid": None}
+            if prep.get("invalid"):
+                res.update(result="✗ blocked by validation", detail=f"invalid field: {prep['invalid']}")
+                if want_shots:
+                    try: shot = await page.screenshot(type="jpeg", quality=60)
+                    except Exception: pass
+                return res
+
+            # ---- submit while recording requests that carry the email ----
+            captured = []
+            on_req = lambda r: captured.append(r) if request_has_email(r, email) else None
+            page.on("request", on_req)
+
+            btn = None
+            try:
+                btn = (await loc.evaluate_handle(FIND_BUTTON_JS)).as_element()
+            except Exception:
+                pass
 
             try:
-                await email_input.scroll_into_view_if_needed()
-                await email_input.focus()
-                
-                # Sped up human typing emulation
-                await email_input.type(email, delay=random.randint(20, 60))
-                await page.mouse.click(5, 5) # Blur click
+                if btn:
+                    try:
+                        await btn.click(timeout=3000)
+                    except Exception:
+                        await btn.click(timeout=2000, force=True)
+                else:
+                    sent = await loc.evaluate(
+                        "e => { const f = e.closest('form'); "
+                        "if (f && f.requestSubmit) { f.requestSubmit(); return true; } return false; }"
+                    )
+                    if not sent:
+                        await loc.press("Enter")
             except Exception as e:
-                await page.close()
-                return {"domain": domain, "status": "Error: Could not fill email"}
+                res.update(result="✗ error", detail=f"submit click failed: {str(e)[:60]}")
+                return res
 
-            submitted = await click_submit(page, email_input)
-            if submitted:
-                success = await check_success(page)
-                status = "Subscribed ✓" if success else "Submitted (Unconfirmed)"
+            # ---- wait for the real request ----
+            waited = 0.0
+            while waited < REQUEST_WAIT and not captured:
+                await asyncio.sleep(0.5)
+                waited += 0.5
+            if captured:
+                await asyncio.sleep(SETTLE_WAIT)
+
+            reqs = await summarize_requests(captured)
+            try:
+                res["final_url"] = page.url
+            except Exception:
+                pass
+
+            ok = [x for x in reqs if x[2] and x[2] < 400]
+            if ok:
+                m, host, code = ok[0]
+                res.update(result="✓ request accepted", detail=f"{m} {host} → {code}")
+            elif reqs:
+                m, host, code = reqs[0]
+                if code is None:
+                    res.update(result="? request sent, no response", detail=f"{m} {host}")
+                else:
+                    res.update(result="✗ request rejected", detail=f"{m} {host} → {code}")
             else:
-                status = "Filled only (No submit button)"
+                res.update(result="✗ no request sent", detail="click happened, nothing carried the email")
 
-            await page.close()
-            return {"domain": domain, "status": status}
+            if not ok and await has_captcha(page):
+                res["detail"] += " [captcha present]"
+
+            if want_shots:
+                try: shot = await page.screenshot(type="jpeg", quality=60)
+                except Exception: pass
+            return res
 
         except Exception as e:
-            try: await page.close() 
-            except: pass
-            return {"domain": domain, "status": f"Error: {str(e)[:50]}"}
+            res.update(result="✗ error", detail=str(e)[:80])
+            return res
+        finally:
+            res["_shot"] = shot
+            if page:
+                if on_req:
+                    try: page.remove_listener("request", on_req)
+                    except Exception: pass
+                try: await page.close()
+                except Exception: pass
 
-async def run_bot(domains, email, progress_bar, status_text):
+
+async def run_bot(domains, email, concurrency, want_shots, progress_bar, status_text):
     results = []
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
         )
         context = await browser.new_context(
             viewport={"width": 1366, "height": 768},
             ignore_https_errors=True,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         )
-        await context.route("**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf,mp4}", lambda route: route.abort())
+        # Images are allowed now (captcha widgets and some forms need them); only block heavy media/fonts
+        await context.route("**/*.{woff,woff2,ttf,mp4,webm}", lambda route: route.abort())
         await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
 
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-        
-        # FIX: Process tasks concurrently and yield as they complete
-        tasks = [process_one(context, domain, email, semaphore) for domain in domains]
-        
-        completed = 0
-        for future in asyncio.as_completed(tasks):
-            res = await future
-            results.append(res)
-            completed += 1
-            status_text.text(f"Processed ({completed}/{len(domains)}): {res['domain']}")
-            progress_bar.progress(completed / len(domains))
+        semaphore = asyncio.Semaphore(concurrency)
+        tasks = [process_one(context, d, email, semaphore, want_shots) for d in domains]
+
+        done = 0
+        for fut in asyncio.as_completed(tasks):
+            r = await fut
+            results.append(r)
+            done += 1
+            status_text.text(f"Processed ({done}/{len(domains)}): {r['domain']} — {r['result']}")
+            progress_bar.progress(done / len(domains))
 
         await browser.close()
     return results
 
+
 # =========================================
-# 5. STREAMLIT USER INTERFACE
+# 6. UI
 # =========================================
 st.title("🚀 Bulk Newsletter Subscriber")
-st.markdown("Automate email signups. Built with Streamlit & Playwright.")
+st.markdown(
+    "Success = a request carrying your email was sent and the server answered 2xx/3xx. "
+    "It does **not** prove a mail will arrive (double opt-in, suppression, dedupe still apply)."
+)
 
 col1, col2 = st.columns([1, 2])
 
 with col1:
     with st.container(border=True):
         email_addr = st.text_input("🎯 Target Email", placeholder="yourname@example.com")
-        domain_list = st.text_area(
-            "🌐 Domains (One per line)", 
-            placeholder="google.com\napple.com",
-            height=250
-        )
+        domain_list = st.text_area("🌐 Domains (One per line)", placeholder="google.com\napple.com", height=250)
+        concurrency = st.slider("Parallel pages", 1, 8, 3)
+        want_shots = st.checkbox("Save screenshot per domain", value=True)
         start_btn = st.button("Start Automation", type="primary", use_container_width=True)
 
 with col2:
@@ -276,29 +425,50 @@ with col2:
 
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            results = loop.run_until_complete(run_bot(domains, email_addr, progress_bar, status_text))
-            
+            results = loop.run_until_complete(
+                run_bot(domains, email_addr.strip(), concurrency, want_shots, progress_bar, status_text)
+            )
             status_text.success("All tasks completed!")
 
-            df = pd.DataFrame(results)
-            total = len(df)
-            confirmed = len(df[df["status"] == "Subscribed ✓"])
-            unconf = len(df[df["status"] == "Submitted (Unconfirmed)"])
-            failed = total - confirmed - unconf
+            # Persist so the download buttons (which rerun the script) don't wipe the results
+            shots = {r["domain"]: r.pop("_shot", None) for r in results}
+            st.session_state["df"] = pd.DataFrame(results)
+            st.session_state["shots"] = {k: v for k, v in shots.items() if v}
 
-            st.write("### 📊 Results Summary")
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Total", total)
-            m2.metric("✓ Success", confirmed)
-            m3.metric("? Unconfirmed", unconf)
-            m4.metric("✗ Failed/Error", failed)
-            
-            st.dataframe(df, use_container_width=True, hide_index=True)
-            
-            csv = df.to_csv(index=False).encode('utf-8')
+    if "df" in st.session_state:
+        df = st.session_state["df"]
+        total = len(df)
+        ok = int(df["result"].str.startswith("✓").sum())
+        unk = int(df["result"].str.startswith("?").sum())
+        bad = total - ok - unk
+
+        st.write("### 📊 Results Summary")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total", total)
+        m2.metric("✓ Request accepted", ok)
+        m3.metric("? No response", unk)
+        m4.metric("✗ Failed", bad)
+
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        st.download_button(
+            "📥 Download Results as CSV",
+            data=df.to_csv(index=False).encode("utf-8"),
+            file_name="newsletter_results.csv",
+            mime="text/csv",
+        )
+
+        shots = st.session_state.get("shots", {})
+        if shots:
+            buf = io.BytesIO()
+            res_by_domain = dict(zip(df["domain"], df["result"]))
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+                for dom, img in shots.items():
+                    tag = re.sub(r"[^a-z0-9]+", "_", res_by_domain.get(dom, "").lower()).strip("_")
+                    z.writestr(f"{dom}__{tag}.jpg", img)
             st.download_button(
-                label="📥 Download Results as CSV",
-                data=csv,
-                file_name='newsletter_results.csv',
-                mime='text/csv',
+                "🖼️ Download Screenshots (ZIP)",
+                data=buf.getvalue(),
+                file_name="screenshots.zip",
+                mime="application/zip",
             )
