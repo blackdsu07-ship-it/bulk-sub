@@ -457,6 +457,7 @@ async def run_bot(domains, email, concurrency, want_shots, progress_bar, status_
         if proxy:
             launch_kwargs["proxy"] = proxy
         browser = None
+        last_err = None
         # headed: prefer the Chrome installed on this machine; headless: full Chromium in new headless mode
         for ch in (["chrome"] if headed else []) + ["chromium", None]:
             try:
@@ -465,12 +466,11 @@ async def run_bot(domains, email, concurrency, want_shots, progress_bar, status_
                     kw["channel"] = ch
                 browser = await p.chromium.launch(**kw)
                 break
-            except Exception:
+            except Exception as e:
+                last_err = e
                 continue
         if browser is None:
-            raise RuntimeError(
-                "Could not launch a browser. Headed mode needs a display: run the app locally, not on Streamlit Cloud."
-            )
+            raise RuntimeError(f"Could not launch a browser ({'headed' if headed else 'headless'}): {str(last_err)[:300]}")
         context = await browser.new_context(
             viewport={"width": 1366, "height": 768},
             ignore_https_errors=True,
@@ -524,6 +524,8 @@ with col2:
         domains = parse_domains(domain_list)
         if not email_addr or not domains:
             st.error("Please enter both an email and at least one valid domain.")
+        elif show_browser and os.path.exists("/mount/src"):
+            st.error("Headed browser can't run on Streamlit Cloud (no display). Untick it, or run the app locally.")
         else:
             st.write("### ⚙️ Live Activity")
             progress_bar = st.progress(0)
@@ -531,16 +533,22 @@ with col2:
 
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            results = loop.run_until_complete(
-                run_bot(domains, email_addr.strip(), concurrency, want_shots, progress_bar, status_text,
-                        parse_proxy(proxy_url), show_browser)
-            )
-            status_text.success("All tasks completed!")
+            try:
+                results = loop.run_until_complete(
+                    run_bot(domains, email_addr.strip(), concurrency, want_shots, progress_bar, status_text,
+                            parse_proxy(proxy_url), show_browser)
+                )
+            except Exception as e:
+                results = None
+                st.error(f"{type(e).__name__}: {str(e)[:500]}")
 
-            # Persist so the download buttons (which rerun the script) don't wipe the results
-            shots = {r["domain"]: r.pop("_shot", None) for r in results}
-            st.session_state["df"] = pd.DataFrame(results)
-            st.session_state["shots"] = {k: v for k, v in shots.items() if v}
+            if results is not None:
+                status_text.success("All tasks completed!")
+
+                # Persist so the download buttons (which rerun the script) don't wipe the results
+                shots = {r["domain"]: r.pop("_shot", None) for r in results}
+                st.session_state["df"] = pd.DataFrame(results)
+                st.session_state["shots"] = {k: v for k, v in shots.items() if v}
 
     if "df" in st.session_state:
         df = st.session_state["df"]
