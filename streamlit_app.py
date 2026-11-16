@@ -239,6 +239,28 @@ async def locate_email_input(page):
     return None
 
 
+CHALLENGE_RE = re.compile(
+    r"one moment|just a moment|checking your browser|attention required|"
+    r"verify (that )?you are (a )?human|are you a robot|access denied|pardon our interruption",
+    re.I,
+)
+
+
+async def wait_out_challenge(page, timeout=15):
+    """Passively wait for a JS interstitial to finish. Returns True if still challenged at timeout."""
+    for _ in range(timeout):
+        try:
+            text = await page.evaluate(
+                "() => (document.title || '') + ' ' + (document.body ? document.body.innerText.slice(0, 200) : '')"
+            )
+            if not CHALLENGE_RE.search(text):
+                return False
+        except Exception:
+            pass  # page navigating mid-challenge
+        await asyncio.sleep(1)
+    return True
+
+
 async def summarize_requests(captured):
     out = []
     for r in captured[:6]:
@@ -291,6 +313,7 @@ async def process_one(context, domain, email, semaphore, want_shots):
                 await page.wait_for_load_state("networkidle", timeout=8000)
             except Exception:
                 pass
+            challenged = await wait_out_challenge(page)
             await page.wait_for_timeout(PAGE_LOAD_WAIT)
             try:
                 await page.evaluate(CLEAN_OVERLAYS_JS)
@@ -311,7 +334,7 @@ async def process_one(context, domain, email, semaphore, want_shots):
                 except Exception:
                     info = ""
                 res.update(
-                    result="✗ no email field",
+                    result="✗ blocked by bot protection" if challenged else "✗ no email field",
                     detail=(f"http {nav_status} | iframes: {len(page.frames) - 1} | "
                             f"inputs: {dump or 'none'} | page: {info}")[:400],
                 )
