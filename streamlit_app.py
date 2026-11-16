@@ -173,6 +173,17 @@ def parse_domains(text):
     return domains
 
 
+def parse_proxy(url):
+    if not url or not url.strip():
+        return None
+    u = urlparse(url.strip() if "://" in url else "http://" + url.strip())
+    cfg = {"server": f"{u.scheme}://{u.hostname}:{u.port}" if u.port else f"{u.scheme}://{u.hostname}"}
+    if u.username:
+        cfg["username"] = unquote_plus(u.username)
+        cfg["password"] = unquote_plus(u.password or "")
+    return cfg
+
+
 def request_has_email(req, email):
     """True if this request looks like it carries the email to some backend."""
     try:
@@ -263,9 +274,11 @@ async def process_one(context, domain, email, semaphore, want_shots):
             page = await context.new_page()
 
             nav_ok = False
+            nav_status = None
             for scheme in ("https", "http"):
                 try:
-                    await page.goto(f"{scheme}://{domain}", wait_until="domcontentloaded", timeout=20000)
+                    resp = await page.goto(f"{scheme}://{domain}", wait_until="domcontentloaded", timeout=20000)
+                    nav_status = resp.status if resp else None
                     nav_ok = True
                     break
                 except Exception:
@@ -274,6 +287,10 @@ async def process_one(context, domain, email, semaphore, want_shots):
                 res["detail"] = "navigation failed"
                 return res
 
+            try:
+                await page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass
             await page.wait_for_timeout(PAGE_LOAD_WAIT)
             try:
                 await page.evaluate(CLEAN_OVERLAYS_JS)
@@ -286,9 +303,17 @@ async def process_one(context, domain, email, semaphore, want_shots):
                     dump = await page.evaluate(DUMP_INPUTS_JS)
                 except Exception:
                     dump = ""
+                try:
+                    info = await page.evaluate(
+                        "() => (document.title || '') + ' || ' + "
+                        "(document.body ? document.body.innerText.replace(/\\s+/g, ' ').slice(0, 120) : 'NO BODY')"
+                    )
+                except Exception:
+                    info = ""
                 res.update(
                     result="✗ no email field",
-                    detail=f"iframes: {len(page.frames) - 1} | visible inputs: {dump or 'none'}"[:300],
+                    detail=(f"http {nav_status} | iframes: {len(page.frames) - 1} | "
+                            f"inputs: {dump or 'none'} | page: {info}")[:400],
                 )
                 try:
                     res["final_url"] = page.url
@@ -398,13 +423,20 @@ async def process_one(context, domain, email, semaphore, want_shots):
                 except Exception: pass
 
 
-async def run_bot(domains, email, concurrency, want_shots, progress_bar, status_text):
+async def run_bot(domains, email, concurrency, want_shots, progress_bar, status_text, proxy=None):
     results = []
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
+        launch_kwargs = dict(
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
         )
+        if proxy:
+            launch_kwargs["proxy"] = proxy
+        try:
+            # full Chromium in new headless mode is much harder to fingerprint than the headless shell
+            browser = await p.chromium.launch(channel="chromium", **launch_kwargs)
+        except Exception:
+            browser = await p.chromium.launch(**launch_kwargs)
         context = await browser.new_context(
             viewport={"width": 1366, "height": 768},
             ignore_https_errors=True,
@@ -446,6 +478,7 @@ with col1:
         domain_list = st.text_area("🌐 Domains (One per line)", placeholder="google.com\napple.com", height=250)
         concurrency = st.slider("Parallel pages", 1, 8, 3)
         want_shots = st.checkbox("Save screenshot per domain", value=True)
+        proxy_url = st.text_input("Proxy (optional)", placeholder="http://user:pass@host:port")
         start_btn = st.button("Start Automation", type="primary", use_container_width=True)
 
 with col2:
@@ -461,7 +494,8 @@ with col2:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             results = loop.run_until_complete(
-                run_bot(domains, email_addr.strip(), concurrency, want_shots, progress_bar, status_text)
+                run_bot(domains, email_addr.strip(), concurrency, want_shots, progress_bar, status_text,
+                        parse_proxy(proxy_url))
             )
             status_text.success("All tasks completed!")
 
