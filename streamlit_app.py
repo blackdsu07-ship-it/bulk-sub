@@ -20,7 +20,8 @@ st.set_page_config(page_title="Bulk Newsletter Subscriber", page_icon="🚀", la
 @st.cache_resource
 def install_playwright():
     os.system("playwright install chromium")
-    os.system("playwright install-deps chromium")
+    if os.path.exists("/mount/src"):  # Streamlit Cloud
+        os.system("playwright install-deps chromium")
 
 
 install_playwright()
@@ -286,7 +287,7 @@ async def has_captcha(page):
 # =========================================
 # 5. CORE
 # =========================================
-async def process_one(context, domain, email, semaphore, want_shots):
+async def process_one(context, domain, email, semaphore, want_shots, challenge_timeout=15):
     async with semaphore:
         res = {"domain": domain, "result": "✗ error", "detail": "", "final_url": ""}
         shot = None
@@ -313,7 +314,7 @@ async def process_one(context, domain, email, semaphore, want_shots):
                 await page.wait_for_load_state("networkidle", timeout=8000)
             except Exception:
                 pass
-            challenged = await wait_out_challenge(page)
+            challenged = await wait_out_challenge(page, challenge_timeout)
             await page.wait_for_timeout(PAGE_LOAD_WAIT)
             try:
                 await page.evaluate(CLEAN_OVERLAYS_JS)
@@ -446,20 +447,30 @@ async def process_one(context, domain, email, semaphore, want_shots):
                 except Exception: pass
 
 
-async def run_bot(domains, email, concurrency, want_shots, progress_bar, status_text, proxy=None):
+async def run_bot(domains, email, concurrency, want_shots, progress_bar, status_text, proxy=None, headed=False):
     results = []
     async with async_playwright() as p:
         launch_kwargs = dict(
-            headless=True,
+            headless=not headed,
             args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
         )
         if proxy:
             launch_kwargs["proxy"] = proxy
-        try:
-            # full Chromium in new headless mode is much harder to fingerprint than the headless shell
-            browser = await p.chromium.launch(channel="chromium", **launch_kwargs)
-        except Exception:
-            browser = await p.chromium.launch(**launch_kwargs)
+        browser = None
+        # headed: prefer the Chrome installed on this machine; headless: full Chromium in new headless mode
+        for ch in (["chrome"] if headed else []) + ["chromium", None]:
+            try:
+                kw = dict(launch_kwargs)
+                if ch:
+                    kw["channel"] = ch
+                browser = await p.chromium.launch(**kw)
+                break
+            except Exception:
+                continue
+        if browser is None:
+            raise RuntimeError(
+                "Could not launch a browser. Headed mode needs a display: run the app locally, not on Streamlit Cloud."
+            )
         context = await browser.new_context(
             viewport={"width": 1366, "height": 768},
             ignore_https_errors=True,
@@ -470,7 +481,7 @@ async def run_bot(domains, email, concurrency, want_shots, progress_bar, status_
         await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
 
         semaphore = asyncio.Semaphore(concurrency)
-        tasks = [process_one(context, d, email, semaphore, want_shots) for d in domains]
+        tasks = [process_one(context, d, email, semaphore, want_shots, 90 if headed else 15) for d in domains]
 
         done = 0
         for fut in asyncio.as_completed(tasks):
@@ -502,6 +513,10 @@ with col1:
         concurrency = st.slider("Parallel pages", 1, 8, 3)
         want_shots = st.checkbox("Save screenshot per domain", value=True)
         proxy_url = st.text_input("Proxy (optional)", placeholder="http://user:pass@host:port")
+        show_browser = st.checkbox(
+            "Show real browser window (run locally only)", value=False,
+            help="Needs a display. If a site shows a human-check, you can complete it yourself in the window (waits up to 90s).",
+        )
         start_btn = st.button("Start Automation", type="primary", use_container_width=True)
 
 with col2:
@@ -518,7 +533,7 @@ with col2:
             asyncio.set_event_loop(loop)
             results = loop.run_until_complete(
                 run_bot(domains, email_addr.strip(), concurrency, want_shots, progress_bar, status_text,
-                        parse_proxy(proxy_url))
+                        parse_proxy(proxy_url), show_browser)
             )
             status_text.success("All tasks completed!")
 
